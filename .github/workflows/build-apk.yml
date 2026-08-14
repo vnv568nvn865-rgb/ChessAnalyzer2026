@@ -23,6 +23,21 @@ jobs:
           echo "android.useAndroidX=true" >> gradle.properties
           echo "android.enableJetifier=true" >> gradle.properties
 
+      - name: Fix Kotlin duplicate dependencies
+        working-directory: android
+        run: |
+          cat > fix.gradle <<'EOF'
+          allprojects {
+            configurations.all {
+              resolutionStrategy.eachDependency { details ->
+                if (details.requested.group == "org.jetbrains.kotlin") {
+                  details.useVersion "1.8.22"
+                }
+              }
+            }
+          }
+          EOF
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
@@ -36,7 +51,7 @@ jobs:
 
       - name: Build APK
         working-directory: android
-        run: gradle assembleDebug --no-daemon
+        run: gradle --init-script fix.gradle assembleDebug --no-daemon
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
