@@ -2,126 +2,67 @@ name: Build Chess Analyzer APK
 
 on:
   workflow_dispatch:
+  push:
+    paths:
+      - 'ChessAnalyzer_1.2_SOURCE_UPLOAD.zip'
+      - '.github/workflows/build-apk.yml'
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Check source ZIP
+        run: |
+          test -f ChessAnalyzer_1.2_SOURCE_UPLOAD.zip
+          unzip -l ChessAnalyzer_1.2_SOURCE_UPLOAD.zip | grep -q 'android/app/build.gradle'
+
       - name: Extract Android project
-        shell: bash
         run: |
-          set -e
+          rm -rf build-src
+          mkdir build-src
+          unzip -q ChessAnalyzer_1.2_SOURCE_UPLOAD.zip -d build-src
+          test -f build-src/android/app/build.gradle
+          test -f build-src/android/settings.gradle
 
-          echo "Searching for Android project..."
-
-          ZIP_FILE=$(find . -maxdepth 2 -type f -iname "*.zip" | head -1)
-
-          if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No ZIP file found."
-            exit 1
-          fi
-
-          echo "Found ZIP: $ZIP_FILE"
-
-          mkdir -p extracted
-          unzip -o "$ZIP_FILE" -d extracted
-
-          echo "Extracted files:"
-          find extracted -maxdepth 4 -type f | head -100
-
-      - name: Locate Android project
-        shell: bash
-        run: |
-          set -e
-
-          ANDROID_DIR=$(find extracted -type f \( -name "settings.gradle" -o -name "settings.gradle.kts" \) \
-            -print | head -1 | xargs -r dirname)
-
-          if [ -z "$ANDROID_DIR" ]; then
-            echo "ERROR: Android Gradle project was not found."
-            echo "Searching extracted files:"
-            find extracted -maxdepth 5 -type f | head -200
-            exit 1
-          fi
-
-          echo "Android project found at: $ANDROID_DIR"
-          echo "ANDROID_DIR=$ANDROID_DIR" >> "$GITHUB_ENV"
-
-      - name: Enable AndroidX
-        working-directory: ${{ env.ANDROID_DIR }}
-        shell: bash
-        run: |
-          touch gradle.properties
-
-          grep -qF "android.useAndroidX=true" gradle.properties || \
-            echo "android.useAndroidX=true" >> gradle.properties
-
-          grep -qF "android.enableJetifier=true" gradle.properties || \
-            echo "android.enableJetifier=true" >> gradle.properties
-
-      - name: Create Gradle fixes
-        working-directory: ${{ env.ANDROID_DIR }}
-        shell: bash
-        run: |
-          cat > fix.gradle <<'EOF'
-          allprojects {
-              configurations.all {
-                  resolutionStrategy.eachDependency { details ->
-                      if (details.requested.group == "org.jetbrains.kotlin") {
-                          details.useVersion "1.8.22"
-                      }
-                  }
-              }
-          }
-          EOF
-
-      - name: Set up Java
+      - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
 
-      - name: Build APK
-        working-directory: ${{ env.ANDROID_DIR }}
-        shell: bash
+      - name: Build debug APK
+        working-directory: build-src/android
+        run: gradle --no-daemon --stacktrace assembleDebug
+
+      - name: Locate APK
         run: |
-          set -e
+          APK="$(find build-src/android/app/build/outputs/apk/debug -type f -name '*.apk' | head -n 1)"
+          test -n "$APK"
+          cp "$APK" ChessAnalyzer-1.2.0-debug.apk
+          ls -lh ChessAnalyzer-1.2.0-debug.apk
 
-          gradle --init-script fix.gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Find generated APK
-        shell: bash
-        run: |
-          set -e
-
-          APK=$(find "$ANDROID_DIR" -type f -name "*.apk" | head -1)
-
-          if [ -z "$APK" ]; then
-            echo "ERROR: APK was not generated."
-            exit 1
-          fi
-
-          echo "APK found:"
-          echo "$APK"
-
-          cp "$APK" ./ChessAnalyzer.apk
-
-      - name: Upload APK
+      - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ChessAnalyzer-APK
-          path: ChessAnalyzer.apk
-          if-no-files-found: error
+          name: ChessAnalyzer-1.2.0-APK
+          path: ChessAnalyzer-1.2.0-debug.apk
+          retention-days: 90
+
+      - name: Create GitHub Release and attach APK
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.2.0-build-${{ github.run_number }}"
+          gh release create "$TAG" ChessAnalyzer-1.2.0-debug.apk \
+            --title "Chess Analyzer 1.2.0 - Build ${{ github.run_number }}" \
+            --generate-notes
