@@ -11,49 +11,143 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Check Android project
+      - name: Find and extract fixed project
+        shell: bash
         run: |
-          echo "Checking Android project..."
-          test -d android
-          test -f android/settings.gradle
-          test -f android/build.gradle
-          test -d android/app
-          echo "Android project found successfully."
-          find android -maxdepth 2 -type f | sort | head -100
+          set -euo pipefail
 
-      - name: Enable AndroidX
-        working-directory: android
-        run: |
-          touch gradle.properties
-          grep -qxF 'android.useAndroidX=true' gradle.properties || \
-            echo 'android.useAndroidX=true' >> gradle.properties
-          grep -qxF 'android.enableJetifier=true' gradle.properties || \
-            echo 'android.enableJetifier=true' >> gradle.properties
+          ARCHIVE=$(find . -maxdepth 1 -type f \
+            -name 'ChessAnalyzer_READY_TO_BUILD_FIXED*.zip' \
+            | head -n 1)
 
-      - name: Create automatic Gradle fixes
-        working-directory: android
-        run: |
-          cat > fix.gradle <<'EOF'
-          allprojects {
-              configurations.all {
-                  resolutionStrategy.eachDependency { details ->
-                      if (details.requested.group == "org.jetbrains.kotlin") {
-                          details.useVersion "1.8.22"
-                      }
-                  }
-              }
-          }
-          EOF
+          if [ -z "$ARCHIVE" ]; then
+            echo "ERROR: Fixed project ZIP was not found."
+            exit 1
+          fi
 
-      - name: Set up Java
+          echo "Using: $ARCHIVE"
+
+          rm -rf "$RUNNER_TEMP/chess_project"
+          mkdir -p "$RUNNER_TEMP/chess_project"
+
+          unzip -q "$ARCHIVE" -d "$RUNNER_TEMP/chess_project"
+
+          if [ ! -d "$RUNNER_TEMP/chess_project/android" ]; then
+            echo "ERROR: android directory was not found inside ZIP."
+            exit 1
+          fi
+
+          rm -rf android
+          cp -a "$RUNNER_TEMP/chess_project/android" ./android
+
+          echo "Android project extracted successfully."
+
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
-          cache: gradle
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK packages
+        run: |
+          sdkmanager "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Prepare local JavaScript libraries
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rm -rf app/src/main/assets/vendor
+          mkdir -p app/src/main/assets/vendor
+
+          cd "$RUNNER_TEMP"
+
+          npm pack chess.js@1.4.0 --silent
+          tar -xzf chess.js-1.4.0.tgz
+
+          cp package/dist/esm/chess.js \
+            "$GITHUB_WORKSPACE/android/app/src/main/assets/vendor/chess.js"
+
+          test -s \
+            "$GITHUB_WORKSPACE/android/app/src/main/assets/vendor/chess.js"
+
+      - name: Download Stockfish
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd app/src/main/assets/vendor
+
+          curl -fL --retry 5 --retry-delay 2 \
+            -o stockfish-18-lite-single.js \
+            https://github.com/nmrugg/stockfish.js/releases/download/v18.0.0/stockfish-18-lite-single.js
+
+          curl -fL --retry 5 --retry-delay 2 \
+            -o stockfish-18-lite-single.wasm \
+            https://github.com/nmrugg/stockfish.js/releases/download/v18.0.0/stockfish-18-lite-single.wasm
+
+          test -s stockfish-18-lite-single.js
+          test -s stockfish-18-lite-single.wasm
+
+      - name: Convert app.js to normal browser JavaScript
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          npx --yes esbuild@0.25.9 \
+            app/src/main/assets/app.js \
+            --bundle \
+            --format=iife \
+            --outfile=app/src/main/assets/app.bundle.js
+
+          sed -i \
+            's#<script type="module" src="app.js"></script>#<script src="app.bundle.js"></script>#' \
+            app/src/main/assets/index.html
+
+          test -s app/src/main/assets/app.bundle.js
+
+          if grep -q 'type="module" src="app.js"' \
+            app/src/main/assets/index.html; then
+            echo "ERROR: index.html still uses module app.js."
+            exit 1
+          fi
+
+          echo "JavaScript bundled successfully."
+
+      - name: Verify project
+        working-directory: android
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -s app/src/main/AndroidManifest.xml
+          test -s app/src/main/assets/index.html
+          test -s app/src/main/assets/app.js
+          test -s app/src/main/assets/app.bundle.js
+
+          test -s app/src/main/assets/vendor/chess.js
+          test -s app/src/main/assets/vendor/stockfish-18-lite-single.js
+          test -s app/src/main/assets/vendor/stockfish-18-lite-single.wasm
+
+          test -s app/build.gradle
+          test -s build.gradle
+          test -s settings.gradle
+
+          echo "Android project verification passed."
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -63,16 +157,28 @@ jobs:
       - name: Build APK
         working-directory: android
         run: |
-          gradle --init-script fix.gradle assembleDebug --no-daemon --stacktrace
+          gradle assembleDebug --no-daemon --stacktrace
 
-      - name: Find generated APK
+      - name: Verify APK
+        working-directory: android
+        shell: bash
         run: |
-          echo "Searching for APK..."
-          find android/app/build/outputs/apk -type f -name "*.apk" -print
+          set -euo pipefail
+
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "ERROR: APK was not generated."
+            exit 1
+          fi
+
+          echo "APK successfully generated:"
+          ls -lh "$APK"
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ChessAnalyzer-APK
-          path: android/app/build/outputs/apk/debug/*.apk
+          path: android/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
+          retention-days: 14
