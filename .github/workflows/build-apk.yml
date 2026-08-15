@@ -3,6 +3,9 @@ name: Build Chess Analyzer APK
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -11,30 +14,37 @@ jobs:
       - name: Download repository
         uses: actions/checkout@v4
 
-      - name: Extract Android project
+      - name: Check Android project
         run: |
-          unzip -o chess_analyzer_android_project.zip
-          echo "Project extracted"
-          find . -maxdepth 3 -type f | head -100
+          echo "Checking Android project..."
+          test -d android
+          test -f android/settings.gradle
+          test -f android/build.gradle
+          test -d android/app
+          echo "Android project found successfully."
+          find android -maxdepth 2 -type f | sort | head -100
 
       - name: Enable AndroidX
         working-directory: android
         run: |
-          echo "android.useAndroidX=true" >> gradle.properties
-          echo "android.enableJetifier=true" >> gradle.properties
+          touch gradle.properties
+          grep -qxF 'android.useAndroidX=true' gradle.properties || \
+            echo 'android.useAndroidX=true' >> gradle.properties
+          grep -qxF 'android.enableJetifier=true' gradle.properties || \
+            echo 'android.enableJetifier=true' >> gradle.properties
 
-      - name: Fix Kotlin duplicate dependencies
+      - name: Create automatic Gradle fixes
         working-directory: android
         run: |
           cat > fix.gradle <<'EOF'
           allprojects {
-            configurations.all {
-              resolutionStrategy.eachDependency { details ->
-                if (details.requested.group == "org.jetbrains.kotlin") {
-                  details.useVersion "1.8.22"
-                }
+              configurations.all {
+                  resolutionStrategy.eachDependency { details ->
+                      if (details.requested.group == "org.jetbrains.kotlin") {
+                          details.useVersion "1.8.22"
+                      }
+                  }
               }
-            }
           }
           EOF
 
@@ -43,6 +53,7 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
+          cache: gradle
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
@@ -51,10 +62,17 @@ jobs:
 
       - name: Build APK
         working-directory: android
-        run: gradle --init-script fix.gradle assembleDebug --no-daemon
+        run: |
+          gradle --init-script fix.gradle assembleDebug --no-daemon --stacktrace
+
+      - name: Find generated APK
+        run: |
+          echo "Searching for APK..."
+          find android/app/build/outputs/apk -type f -name "*.apk" -print
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ChessAnalyzer-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          path: android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
